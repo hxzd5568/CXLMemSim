@@ -57,9 +57,9 @@ const char *poolStateName(PoolState state) {
 BandwidthBounds computeBounds(const CheckpointConfig &cfg) {
     BandwidthBounds b;
     // The GPU has a single PCIe uplink shared by both memory lanes, and that
-    // uplink only reaches `pcie_efficiency` of its raw link rate in practice.
-    double pcie_write = cfg.gpu_pcie_write_gbps * cfg.pcie_efficiency;
-    double pcie_read = cfg.gpu_pcie_read_gbps * cfg.pcie_efficiency;
+    // uplink only reaches its derived effective rate (TLP overhead model).
+    double pcie_write = pcieEffectiveGbps(cfg.gpu_pcie_write_gbps, cfg);
+    double pcie_read = pcieEffectiveGbps(cfg.gpu_pcie_read_gbps, cfg);
     double cxl_write = cfg.cxl_enabled ? cfg.cxl.write_gbps : 0.0;
     double staging = std::min(pcie_write, cfg.dram.write_gbps + cxl_write);
     double dram_to_store = cfg.dram.read_gbps;
@@ -410,7 +410,7 @@ double CheckpointEngine::stage(uint64_t checkpoint_id, uint64_t num_chunks) {
     // bandwidth -- plus one write latency. This means dual-lane staging helps
     // only when the PCIe uplink is faster than a single lane's write path.
     uint64_t total_bytes = static_cast<uint64_t>(dram_chunks + cxl_chunks) * cfg_.chunk_size;
-    double pcie_write = cfg_.gpu_pcie_write_gbps * cfg_.pcie_efficiency;
+    double pcie_write = pcieEffectiveGbps(cfg_.gpu_pcie_write_gbps, cfg_);
     double gpu_emission_ns = static_cast<double>(total_bytes) / pcie_write;
     double dram_time = static_cast<double>(dram_chunks) * cfg_.chunk_size / cfg_.dram.write_gbps;
     double cxl_time = cfg_.cxl_enabled ? static_cast<double>(cxl_chunks) * cfg_.chunk_size / cfg_.cxl.write_gbps : 0.0;
@@ -603,7 +603,7 @@ double CheckpointEngine::restore(uint64_t checkpoint_id, uint64_t num_chunks) {
         }
 
         // GPU read of the restored chunk.
-        double g_service = static_cast<double>(cfg_.chunk_size) / (cfg_.gpu_pcie_read_gbps * cfg_.pcie_efficiency);
+        double g_service = static_cast<double>(cfg_.chunk_size) / pcieEffectiveGbps(cfg_.gpu_pcie_read_gbps, cfg_);
         uint64_t g_start = std::max(ready, gpu_busy);
         uint64_t g_finish = g_start + static_cast<uint64_t>(g_service);
         gpu_busy = g_finish;

@@ -49,9 +49,10 @@ int main() {
 
     // --- dual-lane gives a larger gain vs a slow lane (CXL-only) ---
     {
-        // Single CXL lane staging rate = min(effective PCIe 54.4, CXL.write 28) = 28.
-        double pcie_eff = ckpt_test::defaultConfig(2).gpu_pcie_write_gbps * ckpt_test::defaultConfig(2).pcie_efficiency;
-        double bw_single_cxl = std::min(pcie_eff, ckpt_test::defaultConfig(2).cxl.write_gbps);
+        // Single CXL lane staging rate = min(effective PCIe ~55.5, CXL.write 28) = 28.
+        CheckpointConfig base = ckpt_test::defaultConfig(2);
+        double pcie_eff = ckpt::pcieEffectiveGbps(base.gpu_pcie_write_gbps, base);
+        double bw_single_cxl = std::min(pcie_eff, base.cxl.write_gbps);
 
         CheckpointEngine dual(ckpt_test::defaultConfig(2));
         dual.stage(0, chunks);
@@ -65,8 +66,11 @@ int main() {
     // --- PCIe ceiling: a slow uplink caps dual-lane to the uplink itself ---
     {
         CheckpointConfig limited = ckpt_test::defaultConfig(2);
-        limited.gpu_pcie_write_gbps = 20.0; // PCIe uplink slower than both lanes
-        limited.pcie_efficiency = 1.0;
+        limited.gpu_pcie_write_gbps = 20.0; // raw PCIe uplink slower than both lanes
+        // Neutralize the TLP overhead model so "20" is the exact effective rate.
+        limited.pcie_encoding_efficiency = 1.0;
+        limited.pcie_tlp_overhead_bytes = 0;
+        limited.pcie_residual_efficiency = 1.0;
 
         CheckpointConfig single_cfg = limited;
         single_cfg.cxl_enabled = false;

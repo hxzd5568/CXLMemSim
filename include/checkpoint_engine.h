@@ -63,8 +63,12 @@ const char *chunkStateName(ChunkState state);
 const char *poolStateName(PoolState state);
 
 struct PoolConfig {
-    double read_gbps = 30.0;      // GB/s
-    double write_gbps = 30.0;
+    // Calibration points (like CXLMemSim's --mlc-bandwidth): these are EFFECTIVE
+    // measured bandwidths, not raw peak. Fill them from a benchmark (MLC or a
+    // GPU->host DMA microbenchmark) on the target machine. Defaults are example
+    // values only.
+    double read_gbps = 30.0;  // measured read bandwidth (GB/s)
+    double write_gbps = 30.0; // measured write bandwidth (GB/s)
     double read_latency_ns = 100.0;
     double write_latency_ns = 100.0;
     uint64_t capacity_bytes = 0;  // 0 => derived from chunk slots
@@ -97,14 +101,16 @@ struct CheckpointConfig {
     // DRAM and CXL (and reading back) both traverse it. The aggregate staging
     // rate is therefore min(pcie_effective, dram.write + cxl.write), NOT
     // dram.write + cxl.write by themselves.
-    double gpu_pcie_write_gbps = 64.0; // PCIe Gen5 x16 raw link rate
+    double gpu_pcie_write_gbps = 64.0; // PCIe Gen5 x16 raw line rate (32 GT/s x16)
     double gpu_pcie_read_gbps = 64.0;
 
-    // PCIe transfer efficiency (0..1). The raw link rate is never fully
-    // achievable: TLP headers, 128b/130b encoding, DLLP + flow-control credits
-    // and DMA-engine overhead reduce the usable payload bandwidth. Effective
-    // uplink = gpu_pcie_*_gbps * pcie_efficiency (~0.85 for large transfers).
-    double pcie_efficiency = 0.85;
+    // PCIe link overhead model: derives the achievable payload fraction from
+    // the TLP structure instead of a magic efficiency constant.
+    //   effective = raw * (128/130) * MPS/(MPS+overhead) * residual
+    double pcie_encoding_efficiency = 128.0 / 130.0; // 128b/130b line coding
+    uint32_t pcie_max_payload_bytes = 256;           // TLP MaxPayloadSize
+    uint32_t pcie_tlp_overhead_bytes = 20;           // TLP header (16 B) + LCRC (4 B)
+    double pcie_residual_efficiency = 0.95; // DLLP/ACK/flow-control/DMA-engine residual
 
     PoolConfig dram;
     PoolConfig cxl;
@@ -122,6 +128,16 @@ struct CheckpointConfig {
 
     bool cxl_enabled = true;
 };
+
+// Derives the achievable PCIe payload bandwidth from the TLP-structure
+// parameters: 128b/130b encoding, TLP header/LCRC overhead, and a small
+// residual (DLLP/ACK/flow-control/DMA engine). This replaces a flat magic
+// efficiency constant with a formula whose inputs are physical link settings.
+inline double pcieEffectiveGbps(double raw_gbps, const CheckpointConfig &cfg) {
+    double tlp_ratio = static_cast<double>(cfg.pcie_max_payload_bytes) /
+                       static_cast<double>(cfg.pcie_max_payload_bytes + cfg.pcie_tlp_overhead_bytes);
+    return raw_gbps * cfg.pcie_encoding_efficiency * tlp_ratio * cfg.pcie_residual_efficiency;
+}
 
 struct LaneStats {
     uint64_t queued_bytes = 0;
