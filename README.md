@@ -24,6 +24,7 @@ lib/qemu/                              QEMU tree with CXL Type 2/Type 3 device c
 lib/qemu/hw/cxl/cxl_type2.c            QEMU CXL Type 2 device model
 lib/qemu/hw/cxl/cxl_hetgpu.c           Host GPU backend bridge
 lib/qemu/include/hw/cxl/               QEMU CXL Type 2 protocol headers
+checkpoint/                            GPU checkpoint/restore data-movement engine (analysis + execution manual)
 ```
 
 ## Implementation Overview

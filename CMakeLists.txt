@@ -295,6 +295,31 @@ add_executable(test_dax_back_invalidation tests/test_dax_back_invalidation.cpp)
 target_include_directories(test_dax_back_invalidation PRIVATE include src)
 target_link_libraries(test_dax_back_invalidation ${RT_LIB} ${ATOMIC_LIB})
 
+# ---------------------------------------------------------------------------
+# GPU checkpoint/restore data-movement engine (target.md re-implementation).
+# Self-contained: depends only on the C++ standard library (no perf/BPF/spdlog)
+# so it builds even when the host lacks bpf headers used by `cxlmemsim`.
+# ---------------------------------------------------------------------------
+add_library(cxlmemsim_ckpt STATIC
+    src/checkpoint_payload.cpp
+    src/parallel_storage.cpp
+    src/checkpoint_engine.cpp
+)
+target_include_directories(cxlmemsim_ckpt PUBLIC include)
+
+foreach(ckpt_test
+    test_checkpoint_payload
+    test_checkpoint_storage
+    test_checkpoint_engine
+    test_checkpoint_balancer
+    test_checkpoint_hotstandby
+    test_checkpoint_acceptance)
+    add_executable(${ckpt_test} tests/${ckpt_test}.cpp)
+    target_include_directories(${ckpt_test} PRIVATE include tests)
+    target_link_libraries(${ckpt_test} cxlmemsim_ckpt)
+    add_test(NAME ${ckpt_test} COMMAND ${ckpt_test})
+endforeach()
+
 # Installation targets
 install(TARGETS cxlmemsim_server
         RUNTIME DESTINATION bin)
