@@ -1,13 +1,12 @@
 /*
- * Balancer + pressure control.
+ * Offload plan + pressure control under the target2 model (expander direct-attach).
  *
- * Honest staging-bandwidth accounting: the GPU has a single PCIe uplink shared
- * by both lanes, so aggregate staging is min(PCIe, DRAM_write + CXL_write).
- * With realistic DRAM (faster than PCIe), a single DRAM lane already saturates
- * the uplink, so acceptance #2 ("dual path > fastest single path") is NOT met
- * on a single-node topology -- dual-lane only helps against a lane that is
- * itself slower than PCIe (e.g. CXL-only). This matches SimCXL's honest P10
- * conclusion. Also covers #6 (pinned pool reuses but never grows under pressure).
+ * The balancer is no longer a per-chunk greedy chooser; placement is a static
+ * offload plan (section 7) computed once at stage() time, with the memcpy
+ * address (split unit) fixing DRAM vs CXL. This test covers:
+ *   - the plan's split ratio (alpha) matches the water-filling closed form
+ *     (both lines are Gen5 x16, so alpha = 0.5 for wide backends);
+ *   - #6: pinned pool reuses but never grows under pressure.
  *
  * SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
  * Copyright 2025 Regents of the University of California
@@ -21,71 +20,34 @@
 using namespace ckpt;
 
 int main() {
-    constexpr uint64_t chunks = 1024;
+    constexpr uint64_t kMiB = 1024ull * 1024ull;
+    constexpr uint64_t chunks = (512ull * kMiB) / 4096; // 512 MiB
     const uint64_t bytes = chunks * 4096;
 
-    // --- honest #2: dual-lane gives a modest (not 2x) staging gain ---
-    // Single-DRAM (50 GB/s effective) cannot saturate the ~54 GB/s effective
-    // PCIe uplink, so adding the CXL lane (28 GB/s) uses the remaining PCIe
-    // headroom -- but the total is still capped by the uplink.
+    // --- offload plan split ratio (water-fill) ---
     {
-        CheckpointConfig single_cfg = ckpt_test::defaultConfig(2);
-        single_cfg.cxl_enabled = false;
-        CheckpointEngine single(single_cfg);
-        single.stage(0, chunks);
-        double bw_single = ckpt_test::bandwidthGbps(bytes, single.stats().gpu_stage_time_ns);
+        CheckpointConfig cfg = ckpt_test::defaultConfig(2);
+        cfg.dram.capacity_bytes = 1 * kMiB * 1024;
+        cfg.cxl.capacity_bytes = 1 * kMiB * 1024;
+        ckpt_test::disablePoolPressure(cfg);
 
-        CheckpointEngine dual(ckpt_test::defaultConfig(2));
-        dual.stage(0, chunks);
-        double bw_dual = ckpt_test::bandwidthGbps(bytes, dual.stats().gpu_stage_time_ns);
+        double b1 = std::min(ckpt::pcieWriteGbps(cfg.line_dram, cfg), cfg.dram.aggregateWriteGbps());
+        double b2 = std::min(ckpt::pcieWriteGbps(cfg.line_cxl, cfg), cfg.cxl.aggregateWriteGbps());
 
-        // Dual must exceed single, but only modestly (bounded by the shared
-        // uplink, not 2x as target.md assumed).
-        REQUIRE_MSG(bw_dual > bw_single, "dual %.2f should exceed single DRAM %.2f", bw_dual, bw_single);
-        REQUIRE_MSG(bw_dual < bw_single * 1.25, "dual %.2f should be a modest gain over single %.2f", bw_dual, bw_single);
-        std::printf("[staging] single DRAM %.2f -> dual %.2f GB/s (%.2fx; both below raw 64 GB/s PCIe)\n", bw_single,
-                    bw_dual, bw_dual / bw_single);
-    }
+        CheckpointEngine e(cfg);
+        e.stage(0, chunks);
+        const PlacementPlan &p = e.plan();
 
-    // --- dual-lane gives a larger gain vs a slow lane (CXL-only) ---
-    {
-        // Single CXL lane staging rate = min(effective PCIe ~55.5, CXL.write 28) = 28.
-        CheckpointConfig base = ckpt_test::defaultConfig(2);
-        double pcie_eff = ckpt::pcieEffectiveGbps(base.gpu_pcie_write_gbps, base);
-        double bw_single_cxl = std::min(pcie_eff, base.cxl.write_gbps);
-
-        CheckpointEngine dual(ckpt_test::defaultConfig(2));
-        dual.stage(0, chunks);
-        double bw_dual = ckpt_test::bandwidthGbps(bytes, dual.stats().gpu_stage_time_ns);
-
-        REQUIRE_MSG(bw_dual > bw_single_cxl, "dual %.2f should exceed single CXL %.2f", bw_dual, bw_single_cxl);
-        std::printf("[staging] dual %.2f GB/s > single CXL %.2f GB/s (dual-lane helps vs a slow lane)\n", bw_dual,
-                    bw_single_cxl);
-    }
-
-    // --- PCIe ceiling: a slow uplink caps dual-lane to the uplink itself ---
-    {
-        CheckpointConfig limited = ckpt_test::defaultConfig(2);
-        limited.gpu_pcie_write_gbps = 20.0; // raw PCIe uplink slower than both lanes
-        // Neutralize the TLP overhead model so "20" is the exact effective rate.
-        limited.pcie_encoding_efficiency = 1.0;
-        limited.pcie_tlp_overhead_bytes = 0;
-        limited.pcie_residual_efficiency = 1.0;
-
-        CheckpointConfig single_cfg = limited;
-        single_cfg.cxl_enabled = false;
-        CheckpointEngine ls(single_cfg);
-        ls.stage(0, chunks);
-        double bw_single = ckpt_test::bandwidthGbps(bytes, ls.stats().gpu_stage_time_ns);
-
-        CheckpointEngine ld(limited);
-        ld.stage(0, chunks);
-        double bw_dual = ckpt_test::bandwidthGbps(bytes, ld.stats().gpu_stage_time_ns);
-
-        REQUIRE_MSG(bw_dual <= bw_single * 1.05 + 0.5,
-                    "PCIe-limited dual %.2f should not exceed single %.2f by >5%%", bw_dual, bw_single);
-        std::printf("[staging] PCIe-limited (20 GB/s uplink): dual %.2f ~= single %.2f GB/s (ceiling honored)\n", bw_dual,
-                    bw_single);
+        // Both lines are Gen5 x16 (~55.5 GB/s) and both backends exceed that, so
+        // the water-fill splits 50/50 (alpha = B1/(B1+B2) = 0.5).
+        double alpha_expect = b1 / (b1 + b2);
+        std::printf("[offload] plan alpha %.3f (expect ~%.3f), dram %llu MiB / cxl %llu MiB\n", p.alpha, alpha_expect,
+                    (unsigned long long)(p.dram_bytes / kMiB), (unsigned long long)(p.cxl_bytes / kMiB));
+        REQUIRE(!p.unit_lane.empty());
+        REQUIRE_MSG(p.alpha > 0.0 && p.alpha < 1.0, "alpha %.3f should split both lanes", p.alpha);
+        REQUIRE(p.dram_bytes > 0 && p.cxl_bytes > 0);
+        REQUIRE(p.dram_bytes + p.cxl_bytes == bytes);
+        REQUIRE_MSG(p.alpha > 0.45 && p.alpha < 0.55, "alpha %.3f should be ~0.5 (both lines Gen5 x16)", p.alpha);
     }
 
     // --- #6: pressure state machine stops pool growth ---
@@ -95,7 +57,7 @@ int main() {
         cfg.dram.capacity_bytes = 65536; // 16 chunks of 4096 B
         CheckpointEngine e(cfg);
 
-        e.stage(0, chunks); // far more than the pool can hold
+        e.stage(0, 1024); // far more than the pool can hold
         const PinnedPool &dram = e.dramPool();
         REQUIRE(dram.pinnedBytes() <= cfg.dram.capacity_bytes);
         REQUIRE(dram.state() != PoolState::NORMAL);
@@ -103,7 +65,6 @@ int main() {
         uint64_t pinned_after = dram.pinnedBytes();
         REQUIRE(pinned_after > 0);
 
-        // Further staging must not grow the pool (reuse only, no expansion).
         e.stage(1, 256);
         REQUIRE(e.dramPool().pinnedBytes() == pinned_after);
 

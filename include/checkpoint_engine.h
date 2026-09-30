@@ -63,12 +63,14 @@ const char *chunkStateName(ChunkState state);
 const char *poolStateName(PoolState state);
 
 struct PoolConfig {
-    // Calibration points (like CXLMemSim's --mlc-bandwidth): these are EFFECTIVE
-    // measured bandwidths, not raw peak. Fill them from a benchmark (MLC or a
-    // GPU->host DMA microbenchmark) on the target machine. Defaults are example
-    // values only.
-    double read_gbps = 30.0;  // measured read bandwidth (GB/s)
-    double write_gbps = 30.0; // measured write bandwidth (GB/s)
+    // Calibration points (like CXLMemSim's --mlc-bandwidth): PER-LANE effective
+    // measured bandwidths, not raw peak. A lane is one DRAM memory channel (for
+    // DRAM) or one CXL link (for CXL). Aggregate pool bandwidth =
+    // num_lanes * per_lane_gbps. Fill from a benchmark (MLC or a GPU->host DMA
+    // microbenchmark) on the target machine. Defaults are example values only.
+    uint32_t num_lanes = 1;      // # memory channels (DRAM) / CXL links
+    double read_gbps = 30.0;     // measured per-lane read bandwidth (GB/s)
+    double write_gbps = 30.0;    // measured per-lane write bandwidth (GB/s)
     double read_latency_ns = 100.0;
     double write_latency_ns = 100.0;
     uint64_t capacity_bytes = 0;  // 0 => derived from chunk slots
@@ -78,6 +80,9 @@ struct PoolConfig {
     double shrink_threshold = 0.90;
     double stop_threshold = 0.95;
     double recover_threshold = 0.75;
+
+    double aggregateReadGbps() const { return read_gbps * num_lanes; }
+    double aggregateWriteGbps() const { return write_gbps * num_lanes; }
 };
 
 struct ChunkMeta {
@@ -92,6 +97,17 @@ struct ChunkMeta {
     uint32_t pool_slot = 0; // pinned-pool slot within `lane`
 };
 
+// A PCIe data line in the target2 dual-line model. Line 1 (GPU->DRAM) traverses
+// the switch uplink; Line 2 (GPU->CXL Type-3) is switch-local P2P and does NOT
+// consume the uplink. The TLP-structure overhead (encoding/MPS/overhead/residual)
+// is shared across lines and lives in CheckpointConfig.
+struct PcieLinkConfig {
+    double raw_gbps = 64.0;          // raw line rate (Gen5 x16 = 64, Gen4 x16 = 32)
+    bool consumes_uplink = true;     // Line1(DRAM) consumes the switch uplink; Line2(CXL) does not
+    bool device_initiated = false;   // Line2: expander-side DMA (P2P), not host-initiated
+    double write_read_ratio = 1.0;   // effective write = effective read * ratio (posted vs non-posted)
+};
+
 struct CheckpointConfig {
     uint32_t chunk_size = 4096;
     uint32_t num_storage_channels = 2;
@@ -104,13 +120,37 @@ struct CheckpointConfig {
     double gpu_pcie_write_gbps = 64.0; // PCIe Gen5 x16 raw line rate (32 GT/s x16)
     double gpu_pcie_read_gbps = 64.0;
 
+    // ---- target2 dual-line model (E0) ----
+    // Two independent PCIe data lines replace the single shared uplink. Line 1
+    // (DRAM) traverses the switch uplink; Line 2 (CXL) is switch-local P2P.
+    PcieLinkConfig line_dram{};  // raw 64 (Gen5 x16), consumes_uplink=true
+    PcieLinkConfig line_cxl{};   // raw 64 (Gen5 x16), consumes_uplink=false, device_initiated=true
+    uint32_t num_gpus = 1;           // GPUs sharing the fabric
+    double gpu_egress_gbps = 32.0;   // per-GPU PCIe Gen4 x16 raw egress (source-side bound)
+
+    // ---- offload plan (section 7) ----
+    uint32_t split_unit_bytes = 256u * 1024u * 1024u; // 256 MiB split unit (memcpy address granularity)
+    uint32_t monitor_period_units = 4;               // re-check drift every N split units
+    double drift_bw_threshold = 0.15;                // |B_measured - B_assumed| / B_assumed
+    uint64_t drift_retry_threshold = 16;             // retries + queue_full per window
+    double drift_cap_threshold = 0.20;               // pool free fraction below which to re-plan (FROZEN ~80%)
+
     // PCIe link overhead model: derives the achievable payload fraction from
     // the TLP structure instead of a magic efficiency constant.
-    //   effective = raw * (128/130) * MPS/(MPS+overhead) * residual
-    double pcie_encoding_efficiency = 128.0 / 130.0; // 128b/130b line coding
+    //   effective = raw * (line coding) * MPS/(MPS+overhead) * residual
+    // Line coding: Gen3+ = 128b/130b (128/130 ~ 0.985), Gen1/2 = 8b/10b (8/10 = 0.8).
+    // Pick based on `lspci LnkSta` link speed.
+    double pcie_encoding_efficiency = 128.0 / 130.0; // 128b/130b line coding (Gen3+)
     uint32_t pcie_max_payload_bytes = 256;           // TLP MaxPayloadSize
     uint32_t pcie_tlp_overhead_bytes = 20;           // TLP header (16 B) + LCRC (4 B)
     double pcie_residual_efficiency = 0.95; // DLLP/ACK/flow-control/DMA-engine residual
+
+    // CXL.mem flit framing: DEPRECATED in the target2 expander-direct-attach
+    // topology. The GPU->CXL DDR DMA is pure PCIe TLP (P2P), NOT CXL.mem, so it
+    // carries no 68B flit; the CXL backend is raw DDR bandwidth (see
+    // cxlOverheadFactor -> 1.0). Kept for API compatibility only.
+    uint32_t cxl_flit_data_bytes = 64;
+    uint32_t cxl_flit_total_bytes = 68;
 
     PoolConfig dram;
     PoolConfig cxl;
@@ -126,17 +166,45 @@ struct CheckpointConfig {
     double token_rate_chunks_per_sec = 0.0;
     double token_burst_chunks = 0.0;
 
+    bool dram_enabled = true;
     bool cxl_enabled = true;
 };
 
 // Derives the achievable PCIe payload bandwidth from the TLP-structure
-// parameters: 128b/130b encoding, TLP header/LCRC overhead, and a small
-// residual (DLLP/ACK/flow-control/DMA engine). This replaces a flat magic
-// efficiency constant with a formula whose inputs are physical link settings.
+// parameters: line coding, TLP header/LCRC overhead, and a small residual
+// (DLLP/ACK/flow-control/DMA engine). This replaces a flat magic efficiency
+// constant with a formula whose inputs are physical link settings.
 inline double pcieEffectiveGbps(double raw_gbps, const CheckpointConfig &cfg) {
     double tlp_ratio = static_cast<double>(cfg.pcie_max_payload_bytes) /
                        static_cast<double>(cfg.pcie_max_payload_bytes + cfg.pcie_tlp_overhead_bytes);
     return raw_gbps * cfg.pcie_encoding_efficiency * tlp_ratio * cfg.pcie_residual_efficiency;
+}
+
+// Read / write effective rates for a data line. The write direction carries a
+// posted/non-posted completion penalty (paper: write ~= read * 0.65), modelled
+// by PcieLinkConfig::write_read_ratio.
+inline double pcieReadGbps(const PcieLinkConfig &link, const CheckpointConfig &cfg) {
+    return pcieEffectiveGbps(link.raw_gbps, cfg);
+}
+
+inline double pcieWriteGbps(const PcieLinkConfig &link, const CheckpointConfig &cfg) {
+    return pcieEffectiveGbps(link.raw_gbps, cfg) * link.write_read_ratio;
+}
+
+// CXL.mem flit efficiency: data bytes per on-wire flit byte (64/68). Deprecated
+// in the target2 topology (see cxlOverheadFactor).
+inline double cxlFlitEfficiency(const CheckpointConfig &cfg) {
+    return static_cast<double>(cfg.cxl_flit_data_bytes) / static_cast<double>(cfg.cxl_flit_total_bytes);
+}
+
+// CXL backend overhead factor. In the target2 topology the CXL expander is
+// directly attached to the PCIe switch and its GPU->CXL DDR DMA is pure PCIe TLP
+// (P2P) -- there is NO CXL.mem 68B flit. The CXL backend rate is therefore raw
+// DDR bandwidth (no line coding, no flit), and this factor is 1.0. (Kept for API
+// compatibility with the pre-target2 model.)
+inline double cxlOverheadFactor(const CheckpointConfig &cfg) {
+    (void)cfg;
+    return 1.0;
 }
 
 struct LaneStats {
@@ -151,6 +219,20 @@ struct LaneStats {
     uint64_t completed_bytes = 0;
 };
 
+// Per-line (PCIe data line) statistics for the target2 dual-line model (A2/A7).
+struct LinkStats {
+    uint64_t write_bytes = 0;
+    uint64_t read_bytes = 0;
+    uint64_t completed_bytes = 0;
+    uint64_t queued_bytes = 0;
+    uint64_t outstanding = 0;
+    uint64_t retries = 0;
+    uint64_t queue_full = 0;
+    uint64_t device_initiated_bytes = 0; // A5: expander-side P2P bytes
+    uint64_t host_initiated_bytes = 0;   // A5: host-initiated bytes
+    bool counts_toward_uplink = true;    // A2: Line1=true, Line2=false
+};
+
 struct EngineStats {
     double gpu_stage_time_ns = 0.0;          // phase-1 GPU-visible staging time
     double gpu_stall_time_ns = 0.0;          // alias for stage time (phase 1)
@@ -162,6 +244,7 @@ struct EngineStats {
     uint64_t mismatches = 0;
     double hot_hit_rate = 0.0;
     std::array<LaneStats, 2> lanes{};
+    std::array<LinkStats, 2> links{}; // index 0 = line_dram, 1 = line_cxl
 };
 
 // Bandwidth-model bound helpers (target.md section 5, P8 analysis model).
@@ -172,6 +255,27 @@ struct BandwidthBounds {
 };
 
 BandwidthBounds computeBounds(const CheckpointConfig &cfg);
+
+// ---- Offload plan (section 7) ----
+enum class Placement : uint8_t { EITHER = 0, DRAM = 1, CXL = 2 };
+
+struct OffloadSpec {
+    uint64_t total_bytes = 0;             // checkpoint total bytes (fixed)
+    uint64_t split_unit_bytes = 256ull * 1024 * 1024;
+    std::vector<Placement> affinity;      // size S = total_bytes / split_unit_bytes
+};
+
+struct PlacementPlan {
+    std::vector<LaneId> unit_lane;        // size S: DRAM/CXL per split unit
+    uint64_t dram_bytes = 0;
+    uint64_t cxl_bytes = 0;
+    double alpha = 0.0;                   // dram_bytes / total_bytes
+};
+
+// Static water-filling placement: decides DRAM vs CXL once, at task submission.
+// Returns an empty unit_lane on infeasibility (capacity/affinity violation).
+PlacementPlan planOffload(const OffloadSpec &spec, double B_line1, double B_line2,
+                          uint64_t dram_usable_bytes, uint64_t cxl_usable_bytes);
 
 /*
  * A pinned memory pool backed by real bytes (so the round trip can be verified
@@ -244,6 +348,7 @@ public:
 
     const std::array<LaneStats, 2> &laneStats() const { return lanes_; }
     LaneStats &laneStats(LaneId lane) { return lanes_[static_cast<size_t>(lane)]; }
+    const LaneStats &laneStats(LaneId lane) const { return lanes_[static_cast<size_t>(lane)]; }
 
 private:
     CheckpointConfig cfg_;
@@ -310,9 +415,19 @@ public:
     const ChunkMeta *chunkMeta(uint64_t checkpoint_id, uint32_t chunk_id) const;
 
     // ---- Phase 1: GPU-visible staging ----
-    // Stages `num_chunks` chunks of `checkpoint_id` into DRAM/CXL via the
-    // balancer. Returns total GPU stall time (ns).
+    // Stages `num_chunks` chunks of `checkpoint_id` into DRAM/CXL. Placement is
+    // decided ONCE at task submission by planOffload() (section 7): the memcpy
+    // address (split unit) fixes DRAM vs CXL, so the hot path is an O(1) plan
+    // lookup, not a per-chunk greedy choice. Returns total GPU stall time (ns).
     double stage(uint64_t checkpoint_id, uint64_t num_chunks);
+
+    // Offload plan used by the last stage() call (empty before the first stage).
+    const PlacementPlan &plan() const { return plan_; }
+
+    // Drift detection (section 7.5): true when measured per-line bandwidth has
+    // drifted past drift_bw_threshold, or retries/queue_full/pool-free exceeded
+    // their thresholds, signalling that the tail should be re-planned.
+    bool shouldReplan() const;
 
     // ---- Phase 2: background persist ----
     // Marks PINNED chunks IN_FLIGHT (DMA window; unpin forbidden). No timing.
@@ -371,12 +486,14 @@ private:
     uint64_t now_ = 0;
 
     EngineStats stats_;
+    PlacementPlan plan_;
+    uint64_t next_unit_ = 0; // next split unit not yet staged (re-plan boundary)
 
     PinnedPool &poolOf(LaneId lane);
     const PinnedPool &poolOf(LaneId lane) const;
 
-    // Generate payload + CRC for a chunk and write it into the chosen pool.
-    void stageOne(uint64_t checkpoint_id, uint32_t chunk_id);
+    // Generate payload + CRC for a chunk and write it into the forced pool.
+    void stageOne(uint64_t checkpoint_id, uint32_t chunk_id, LaneId lane);
     // Persist a single chunk (pool read -> storage write). Returns completion ns.
     uint64_t persistOne(const ChunkMeta &meta, const uint8_t *payload);
     // Restore a single chunk (storage/hot read -> pool -> GPU). Returns resume ns.
