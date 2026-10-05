@@ -827,6 +827,151 @@ double CheckpointEngine::restore(uint64_t checkpoint_id, uint64_t num_chunks) {
     return resume;
 }
 
+double CheckpointEngine::restoreDualPath(uint64_t checkpoint_id, uint64_t num_chunks, double hot_fraction) {
+    uint64_t start = now_;
+    stats_.mismatches = 0;
+    stats_.errors = 0;
+    stats_.dual_restore = DualRestoreStats{};
+
+    // Three overlapping streams share one GPU sink. Hot chunks (the first
+    // hot_fraction) come from the CXL hot standby (memory-speed, latency only);
+    // the remaining cold chunks are split across two independent NVMe backends,
+    // each feeding its own landing pool:
+    //   nvme0 -> host DRAM -> GPU   (first half of the cold range)
+    //   nvme1 -> CXL DRAM  -> GPU   (second half of the cold range)
+    uint64_t hot_count = static_cast<uint64_t>(std::round(hot_fraction * static_cast<double>(num_chunks)));
+    hot_count = std::min<uint64_t>(hot_count, num_chunks);
+
+    // Per-device NVMe read resource: num_storage_channels channels at
+    // storage_channel.read_gbps (each device is an independent backend).
+    double dev_read_bw = static_cast<double>(cfg_.num_storage_channels) * cfg_.storage_channel.read_gbps;
+    if (dev_read_bw <= 0.0) {
+        dev_read_bw = 1.0;
+    }
+    double dev_latency = cfg_.storage_channel.base_latency_ns;
+
+    // Landing pools.
+    double dram_land_bw = cfg_.dram_enabled ? cfg_.dram.aggregateWriteGbps() : 1.0;
+    double cxl_land_bw = cfg_.cxl_enabled ? cfg_.cxl.aggregateWriteGbps() * cxlOverheadFactor(cfg_) : 1.0;
+    double dram_land_lat = cfg_.dram.write_latency_ns;
+    double cxl_land_lat = cfg_.cxl.write_latency_ns;
+
+    // Shared GPU sink.
+    double gpu_read_bw = pcieEffectiveGbps(cfg_.gpu_pcie_read_gbps, cfg_);
+    if (gpu_read_bw <= 0.0) {
+        gpu_read_bw = 1.0;
+    }
+
+    uint64_t nvme0_busy = now_;
+    uint64_t nvme1_busy = now_;
+    uint64_t dram_busy = now_;
+    uint64_t cxl_busy = now_;
+    uint64_t gpu_busy = now_;
+    uint64_t max_finish = now_;
+    uint64_t nvme0_fill = now_;
+    uint64_t nvme1_fill = now_;
+
+    std::vector<uint8_t> scratch(cfg_.chunk_size);
+
+    for (uint64_t i = 0; i < num_chunks; ++i) {
+        uint32_t chunk_id = static_cast<uint32_t>(i);
+        auto it = manifest_.find(keyOf(checkpoint_id, chunk_id));
+        if (it == manifest_.end() || it->second.state == ChunkState::FREE) {
+            stats_.errors++;
+            continue;
+        }
+
+        std::vector<uint8_t> buf(cfg_.chunk_size);
+        uint64_t ready = now_;
+        bool served_hot = false;
+
+        if (i < hot_count) {
+            // CXL hot path: resident in the hot standby, no NVMe access.
+            const std::vector<uint8_t> *hot_data = hot_.lookup(checkpoint_id, chunk_id);
+            if (hot_data) {
+                std::memcpy(buf.data(), hot_data->data(), cfg_.chunk_size);
+                ready = now_ + static_cast<uint64_t>(cfg_.hot_read_latency_ns);
+                stats_.dual_restore.hot_bytes += cfg_.chunk_size;
+                served_hot = true;
+            }
+            // Miss falls through to the cold path below.
+        }
+
+        if (!served_hot) {
+            // Round-robin placement across the two backends (matches the RAID-0
+            // striping in ParallelStorage): even cold chunk -> nvme0 -> host DRAM,
+            // odd cold chunk -> nvme1 -> CXL DRAM. Interleaving lets both devices
+            // feed the ordered GPU drain concurrently instead of starving one
+            // device behind the other's contiguous half.
+            bool is_nvme0 = ((i - hot_count) % 2) == 0;
+            // NVMe read -> landing pool.
+            uint64_t &dev_busy = is_nvme0 ? nvme0_busy : nvme1_busy;
+            uint64_t read_service = static_cast<uint64_t>(static_cast<double>(cfg_.chunk_size) / dev_read_bw);
+            uint64_t read_start = std::max(now_, dev_busy);
+            dev_busy = read_start + read_service;
+            uint64_t read_finish = read_start + read_service + static_cast<uint64_t>(dev_latency);
+
+            uint64_t &land_busy = is_nvme0 ? dram_busy : cxl_busy;
+            double land_bw = is_nvme0 ? dram_land_bw : cxl_land_bw;
+            double land_lat = is_nvme0 ? dram_land_lat : cxl_land_lat;
+            uint64_t land_service = static_cast<uint64_t>(static_cast<double>(cfg_.chunk_size) / land_bw);
+            uint64_t land_start = std::max(read_finish, land_busy);
+            land_busy = land_start + land_service;
+            ready = land_start + land_service + static_cast<uint64_t>(land_lat);
+
+            const uint8_t *src = storage_.peek(chunk_id, 0);
+            if (src) {
+                std::memcpy(buf.data(), src, cfg_.chunk_size);
+            } else {
+                stats_.errors++;
+            }
+            if (is_nvme0) {
+                stats_.dual_restore.nvme0_bytes += cfg_.chunk_size;
+                stats_.dual_restore.nvme0_chunks++;
+                nvme0_fill = std::max(nvme0_fill, ready);
+            } else {
+                stats_.dual_restore.nvme1_bytes += cfg_.chunk_size;
+                stats_.dual_restore.nvme1_chunks++;
+                nvme1_fill = std::max(nvme1_fill, ready);
+            }
+        }
+
+        // Shared GPU sink drain.
+        uint64_t gpu_service = static_cast<uint64_t>(static_cast<double>(cfg_.chunk_size) / gpu_read_bw);
+        uint64_t g_start = std::max(ready, gpu_busy);
+        uint64_t g_finish = g_start + gpu_service;
+        gpu_busy = g_finish;
+        max_finish = std::max(max_finish, g_finish);
+
+        // Per-chunk CRC + regenerated payload verification.
+        uint32_t crc = crc32(buf.data(), cfg_.chunk_size);
+        if (crc != it->second.crc32) {
+            stats_.mismatches++;
+        }
+        payloadFill(checkpoint_id, chunk_id, scratch.data(), cfg_.chunk_size);
+        uint64_t mm = 0;
+        if (!payloadVerify(checkpoint_id, chunk_id, buf.data(), cfg_.chunk_size, 0, &mm)) {
+            stats_.mismatches++;
+        }
+    }
+
+    stats_.dual_restore.cold_bytes = stats_.dual_restore.nvme0_bytes + stats_.dual_restore.nvme1_bytes;
+    stats_.dual_restore.nvme0_fill_ns = static_cast<double>(nvme0_fill - start);
+    stats_.dual_restore.nvme1_fill_ns = static_cast<double>(nvme1_fill - start);
+    stats_.dual_restore.gpu_drain_ns = static_cast<double>(gpu_busy - start);
+
+    double resume = static_cast<double>(max_finish - start);
+    stats_.restore_time_ns = resume;
+    // Report the fraction of restore bytes served from the hot standby (the "20%
+    // hot" metric), not the cache lookup ratio (cold chunks bypass the cache).
+    stats_.hot_hit_rate = num_chunks > 0
+                              ? static_cast<double>(stats_.dual_restore.hot_bytes) /
+                                    static_cast<double>(num_chunks * cfg_.chunk_size)
+                              : 0.0;
+    stats_.lanes = balancer_.laneStats();
+    return resume;
+}
+
 void CheckpointEngine::reset() {
     now_ = 0;
     version_ = 0;

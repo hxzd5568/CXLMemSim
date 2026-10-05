@@ -316,6 +316,7 @@ foreach(ckpt_test
     test_checkpoint_lanes
     test_checkpoint_offload
     test_checkpoint_dual_link
+    test_checkpoint_vhot
     test_checkpoint_acceptance)
     add_executable(${ckpt_test} tests/${ckpt_test}.cpp)
     target_include_directories(${ckpt_test} PRIVATE include tests)

@@ -233,6 +233,22 @@ struct LinkStats {
     bool counts_toward_uplink = true;    // A2: Line1=true, Line2=false
 };
 
+// Per-path accounting for the dual-path (vhot) pipelined restore model: cold
+// chunks are split across two independent NVMe backends (nvme0 -> host DRAM ->
+// GPU, nvme1 -> CXL DRAM -> GPU), while hot chunks are served from the CXL hot
+// standby and bypass NVMe entirely.
+struct DualRestoreStats {
+    uint64_t hot_bytes = 0;   // served from CXL hot standby (no NVMe)
+    uint64_t cold_bytes = 0;  // served from NVMe (nvme0 + nvme1)
+    uint64_t nvme0_bytes = 0; // cold bytes restored via nvme0 -> host DRAM
+    uint64_t nvme1_bytes = 0; // cold bytes restored via nvme1 -> CXL DRAM
+    uint64_t nvme0_chunks = 0;
+    uint64_t nvme1_chunks = 0;
+    double nvme0_fill_ns = 0.0; // NVMe read -> landing-pool fill time (path 0)
+    double nvme1_fill_ns = 0.0; // NVMe read -> landing-pool fill time (path 1)
+    double gpu_drain_ns = 0.0;  // shared GPU sink drain time
+};
+
 struct EngineStats {
     double gpu_stage_time_ns = 0.0;          // phase-1 GPU-visible staging time
     double gpu_stall_time_ns = 0.0;          // alias for stage time (phase 1)
@@ -245,6 +261,7 @@ struct EngineStats {
     double hot_hit_rate = 0.0;
     std::array<LaneStats, 2> lanes{};
     std::array<LinkStats, 2> links{}; // index 0 = line_dram, 1 = line_cxl
+    DualRestoreStats dual_restore{};
 };
 
 // Bandwidth-model bound helpers (target.md section 5, P8 analysis model).
@@ -448,6 +465,16 @@ public:
     // served from CXL hot standby. Verifies per-chunk CRC + regenerated payload.
     // Returns time-to-resume (ns).
     double restore(uint64_t checkpoint_id, uint64_t num_chunks);
+
+    // ---- Phase 3b: dual-path pipelined restore (vhot) ----
+    // Restores `num_chunks` chunks as three overlapping streams: the first
+    // `hot_fraction` chunks are served from the CXL hot standby (no NVMe); the
+    // remaining cold chunks are split across two independent NVMe backends --
+    // nvme0 -> host DRAM -> GPU and nvme1 -> CXL DRAM -> GPU -- each pipelined
+    // under Little's law (per-device read serialization + per-pool landing
+    // serialization + a shared GPU sink). Verifies per-chunk CRC + payload.
+    // Returns time-to-resume (ns).
+    double restoreDualPath(uint64_t checkpoint_id, uint64_t num_chunks, double hot_fraction);
 
     // ---- In-flight / unpin safety (acceptance #7) ----
     bool unpinChunk(uint64_t checkpoint_id, uint32_t chunk_id);
